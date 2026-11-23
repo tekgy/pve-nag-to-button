@@ -1,0 +1,189 @@
+#!/bin/sh
+# pve-nag-to-button
+# Replaces the Proxmox VE "No valid subscription" popup with a persistent
+# "Support Proxmox" button in the web UI header, next to Documentation.
+#
+# Plain text throughout: no downloads, no encoded payloads, no sed edits of
+# Proxmox code. It appends small, clearly marked blocks to two JavaScript files
+# and installs an apt hook that re-appends them after Proxmox updates.
+#
+# Usage:
+#   sh pve-nag-to-button install [--dry-run]   copy to /usr/local/sbin, add apt hook, apply
+#   pve-nag-to-button apply [--dry-run]        (re)apply blocks; the apt hook runs this
+#   pve-nag-to-button status                   show what is applied
+#   pve-nag-to-button uninstall [--dry-run]    remove blocks, hook and script
+#
+# After install/uninstall, hard-refresh the browser (Ctrl+Shift+R).
+# License: MIT. Not affiliated with or endorsed by Proxmox Server Solutions GmbH.
+
+set -eu
+
+# ---- Settings (avoid single quotes in these values) -------------------------
+BUTTON_TEXT='Support Proxmox'
+BUTTON_ICON='fa fa-heart'
+BUTTON_COLOR='#E57000'        # Proxmox orange; distinct from the blue Create buttons
+BUTTON_HOVER='#F28C28'
+BUTTON_BORDER='#B85A00'
+BUTTON_URL='https://www.proxmox.com/en/products/proxmox-virtual-environment/pricing'
+BUTTON_TIP='This server runs Proxmox VE without a subscription. If you have budget, a subscription funds development and adds the enterprise repo and vendor support.'
+
+# ---- Paths -------------------------------------------------------------------
+WTK=/usr/share/javascript/proxmox-widget-toolkit/proxmoxlib.js
+PVE=/usr/share/pve-manager/js/pvemanagerlib.js
+SELF=/usr/local/sbin/pve-nag-to-button
+HOOK=/etc/apt/apt.conf.d/99pve-nag-to-button
+BEGIN='/* BEGIN pve-nag-to-button */'
+END='/* END pve-nag-to-button */'
+
+DRY=0
+QUIET=0
+
+say() { [ "$QUIET" -eq 1 ] || printf '%s\n' "$*"; }
+die() { printf 'pve-nag-to-button: %s\n' "$*" >&2; exit 1; }
+need_root() { [ "$(id -u)" -eq 0 ] || [ "$DRY" -eq 1 ] || die "run as root"; }
+has_block() { grep -qF "$BEGIN" "$1"; }
+
+# Popup: Proxmox gates some actions (login, update) behind checked_command(),
+# which shows the dialog and then runs the action. This makes it run the action.
+js_popup() {
+    printf '%s\n' "$BEGIN" \
+        'Proxmox.Utils.checked_command = function (orig) { orig(); };' \
+        "$END"
+}
+
+# Button: waits for the header to exist (i.e. after login), finds the
+# Documentation button, and inserts ours right after it.
+js_button() {
+    cat <<EOF
+$BEGIN
+Ext.onReady(function () {
+    Ext.util.CSS.createStyleSheet(
+        '.pve-nag-to-button { background: $BUTTON_COLOR !important; border-color: $BUTTON_BORDER !important; }' +
+        '.pve-nag-to-button.x-btn-over { background: $BUTTON_HOVER !important; }' +
+        '.pve-nag-to-button .x-btn-inner, .pve-nag-to-button .x-btn-icon-el { color: #fff !important; }',
+        'pve-nag-to-button-css');
+    var timer = setInterval(function () {
+        var docs = Ext.ComponentQuery.query('proxmoxHelpButton').find(function (b) {
+            return b.onlineHelp === 'pve_documentation_index';
+        });
+        if (!docs || !docs.ownerCt) { return; }
+        clearInterval(timer);
+        var bar = docs.ownerCt;
+        bar.insert(bar.items.indexOf(docs) + 1, {
+            xtype: 'button',
+            baseCls: 'x-btn',
+            cls: 'pve-nag-to-button',
+            iconCls: '$BUTTON_ICON',
+            text: '$BUTTON_TEXT',
+            margin: '0 5 0 0',
+            tooltip: '$BUTTON_TIP',
+            handler: function () {
+                window.open('$BUTTON_URL', '_blank', 'noopener');
+            },
+        });
+    }, 1000);
+});
+$END
+EOF
+}
+
+append_block() { # file label generator
+    f=$1; label=$2; gen=$3
+    if [ ! -f "$f" ]; then say "skip   $label: $f not found"; return 0; fi
+    if has_block "$f"; then
+        current=$(awk -v b="$BEGIN" -v e="$END" '$0==b{on=1} on{print} $0==e{on=0}' "$f")
+        if [ "$current" = "$($gen)" ]; then say "ok     $label: already applied"; return 0; fi
+        say "update $label: block differs from this version's settings"
+        strip_block "$f" "$label"
+        [ "$DRY" -eq 1 ] && return 0
+    fi
+    if [ "$DRY" -eq 1 ]; then
+        say "would  $label: append to $f:"; $gen | sed 's/^/         /'; return 0
+    fi
+    { printf '\n'; $gen; } >> "$f"
+    say "added  $label: $f"
+}
+
+strip_block() { # file label
+    f=$1; label=$2
+    if [ ! -f "$f" ] || ! has_block "$f"; then say "none   $label"; return 0; fi
+    if [ "$DRY" -eq 1 ]; then say "would  $label: remove block from $f"; return 0; fi
+    tmp=$(mktemp)
+    awk -v b="$BEGIN" -v e="$END" '$0==b{skip=1} !skip{print} $0==e{skip=0}' "$f" > "$tmp"
+    cat "$tmp" > "$f"   # keep original owner and permissions
+    rm -f "$tmp"
+    say "removed $label: $f"
+}
+
+legacy_warn() {
+    if [ -f /etc/apt/apt.conf.d/99pve-nag-off ] || grep -qs 'NAGOFF\|SUPPORTBTN' "$WTK" "$PVE"; then
+        say "note:  an older hand-pasted version (NAGOFF/SUPPORTBTN, 99pve-nag-off) is present."
+        say "       Remove it first: rm /etc/apt/apt.conf.d/99pve-nag-off /usr/local/sbin/pve-nag-off.sh"
+        say "       then: apt install --reinstall proxmox-widget-toolkit pve-manager"
+    fi
+}
+
+cmd_apply() {
+    need_root
+    append_block "$WTK" "popup " js_popup
+    append_block "$PVE" "button" js_button
+}
+
+cmd_install() {
+    need_root
+    legacy_warn
+    src=$(readlink -f "$0")
+    if [ "$DRY" -eq 1 ]; then
+        say "would  copy $src -> $SELF"
+        say "would  write $HOOK"
+    else
+        [ "$src" = "$SELF" ] || install -m 0755 "$src" "$SELF"
+        printf '%s\n' "DPkg::Post-Invoke { \"if [ -x $SELF ]; then $SELF apply --quiet || true; fi\"; };" > "$HOOK"
+        say "added  hook: $HOOK"
+    fi
+    cmd_apply
+    say "done. Hard-refresh the browser (Ctrl+Shift+R)."
+}
+
+cmd_uninstall() {
+    need_root
+    strip_block "$WTK" "popup "
+    strip_block "$PVE" "button"
+    for f in "$HOOK" "$SELF"; do
+        [ -e "$f" ] || continue
+        if [ "$DRY" -eq 1 ]; then say "would  remove $f"; else rm -f "$f"; say "removed $f"; fi
+    done
+    say "done. Hard-refresh the browser. For byte-identical stock files:"
+    say "      apt install --reinstall proxmox-widget-toolkit pve-manager"
+}
+
+cmd_status() {
+    command -v pveversion >/dev/null 2>&1 && pveversion
+    for pair in "popup :$WTK" "button:$PVE"; do
+        label=${pair%%:*}; f=${pair#*:}
+        if [ ! -f "$f" ]; then echo "$label  missing file $f"
+        elif has_block "$f"; then echo "$label  applied     $f"
+        else echo "$label  not applied $f"; fi
+    done
+    [ -f "$HOOK" ] && echo "hook    present     $HOOK" || echo "hook    absent      $HOOK"
+    [ -x "$SELF" ] && echo "script  present     $SELF" || echo "script  absent      $SELF"
+    legacy_warn
+}
+
+cmd=${1:-}
+[ $# -gt 0 ] && shift
+for a in "$@"; do
+    case $a in
+        --dry-run) DRY=1 ;;
+        --quiet)   QUIET=1 ;;
+        *) die "unknown option: $a" ;;
+    esac
+done
+
+case $cmd in
+    install)   cmd_install ;;
+    apply)     cmd_apply ;;
+    uninstall) cmd_uninstall ;;
+    status)    cmd_status ;;
+    *) sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+esac
